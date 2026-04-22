@@ -1,0 +1,26 @@
+{
+  "name": "loopy",
+  "version": "1.1.0",
+  "description": "Engineering execution workflow for Claude Code, Codex, and Gemini CLI. 14 agents, 12 skills for requirements discovery, research, spiking, planning, multi-agent reviews, TDD execution, iterative optimization, and PR feedback resolution.",
+  "author": {
+    "name": "DevX"
+  },
+  "repository": "https://github.com/enkaybit/loopy",
+  "keywords": [
+    "workflow",
+    "requirements",
+    "research",
+    "spike",
+    "planning",
+    "architecture",
+    "code-review",
+    "tdd",
+    "multi-agent",
+    "execution",
+    "github",
+    "pull-request",
+    "pr",
+    "autoloop",
+    "optimization"
+  ]
+}

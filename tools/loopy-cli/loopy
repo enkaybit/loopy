@@ -1,0 +1,1241 @@
+#!/usr/bin/env python3
+"""
+loopy — structural helper CLI for the loopy SDLC workflow.
+
+Subcommands (read-only unless noted):
+  validate prd <path>             Validate a PRD markdown file against the schema.
+  validate plan <path>            Validate a tech plan markdown file against the schema.
+  state show                      Print current pipeline state for this branch (.loopy/state.yml).
+  state set <key> <value>         Set a top-level scalar key in .loopy/state.yml (writes).
+  state section-baseline <id> <sha>   Record a section baseline SHA (writes).
+  state review-add <scope> <path> Append a review record (writes).
+  verify-tests <plan> <subtask>   Heuristic check that tests were written for a feature subtask.
+  review-save <scope> --stdin     Persist a review report to docs/reviews/ and link from plan (writes).
+                                  Supports repeatable --attach <file> to embed screenshots / other evidence.
+  browser-capture <url> <out>     Thin wrapper over `agent-browser`: open URL, screenshot to <out>.
+                                  Exits 3 (not 1) when agent-browser is not installed, so skills can branch.
+  budget add <kind> <amount>      Append a budget entry (kind=tokens|seconds|usd) (writes).
+  budget summary                  Print a budget summary for current state.
+
+All subcommands exit 0 on success and non-zero on schema / validation failure.
+Only stdlib is used — no external dependencies.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+from typing import Any
+
+
+# ---------------------------------------------------------------------------
+# Minimal YAML writer/reader (subset: flat mappings, lists of mappings, scalars)
+# We deliberately don't pull in PyYAML — stdlib only.
+# ---------------------------------------------------------------------------
+
+
+class MiniYAMLError(Exception):
+    pass
+
+
+def _yaml_scalar(v: Any) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if v is None:
+        return "null"
+    if isinstance(v, (int, float)):
+        return str(v)
+    s = str(v)
+    # Quote if it contains YAML-significant chars or leading/trailing whitespace.
+    if s == "" or re.search(r"[:#\[\]\{\},&*!|>'\"%@`]", s) or s.strip() != s or s.lower() in {"true", "false", "null", "yes", "no"}:
+        return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return s
+
+
+def yaml_dump(data: Any, indent: int = 0) -> str:
+    """Serialize a nested dict/list/scalar to a YAML subset.
+
+    Layout rules (matched by ``yaml_load`` below):
+      - 2-space indents, block style only.
+      - Mappings: ``key: value`` on one line, nested mappings on following lines.
+      - Lists of scalars:   ``- value`` at the same indent as siblings.
+      - Lists of mappings:  each mapping's first key on the same line as ``- ``;
+        subsequent keys indented two spaces beyond ``- `` (i.e., aligned with
+        the first key).
+    """
+    pad = "  " * indent
+    lines: list[str] = []
+    _emit(data, indent, lines, in_list_item=False)
+    text = "\n".join(lines)
+    return text + ("\n" if not text.endswith("\n") else "")
+
+
+def _emit(data: Any, indent: int, lines: list[str], in_list_item: bool) -> None:
+    pad = "  " * indent
+    if isinstance(data, dict):
+        if not data:
+            lines.append(f"{pad}{{}}")
+            return
+        items = list(data.items())
+        for i, (k, v) in enumerate(items):
+            key = _yaml_scalar(k)
+            prefix = pad
+            if in_list_item and i == 0:
+                # The caller already emitted "- " at (indent-1)*2 + 2 cols; we
+                # need to put the first key flush with that. Callers use indent
+                # equal to the content column, so pad is correct.
+                prefix = ""  # caller writes '- ' then we append "key: ..." without pad
+            if isinstance(v, dict):
+                if not v:
+                    lines.append(f"{prefix}{key}: {{}}")
+                else:
+                    lines.append(f"{prefix}{key}:")
+                    _emit(v, indent + 1, lines, in_list_item=False)
+            elif isinstance(v, list):
+                if not v:
+                    lines.append(f"{prefix}{key}: []")
+                else:
+                    lines.append(f"{prefix}{key}:")
+                    child_pad = "  " * (indent + 1)
+                    for item in v:
+                        if isinstance(item, dict):
+                            if not item:
+                                lines.append(f"{child_pad}- {{}}")
+                                continue
+                            # Emit '- ' followed by first key:value, then remaining keys aligned.
+                            sub_items = list(item.items())
+                            fk, fv = sub_items[0]
+                            if isinstance(fv, (dict, list)):
+                                lines.append(f"{child_pad}- {_yaml_scalar(fk)}:")
+                                if isinstance(fv, dict) and fv:
+                                    _emit(fv, indent + 3, lines, in_list_item=False)
+                                elif isinstance(fv, list) and fv:
+                                    fv_pad = "  " * (indent + 3)
+                                    for el in fv:
+                                        if isinstance(el, dict):
+                                            # recurse at indent+2 as a list
+                                            _emit([el], indent + 2, lines, in_list_item=False)
+                                        else:
+                                            lines.append(f"{fv_pad}- {_yaml_scalar(el)}")
+                                else:
+                                    lines.append(f"{child_pad}  {'{}' if isinstance(fv, dict) else '[]'}")
+                            else:
+                                lines.append(f"{child_pad}- {_yaml_scalar(fk)}: {_yaml_scalar(fv)}")
+                            rest_pad = "  " * (indent + 2)
+                            for k2, v2 in sub_items[1:]:
+                                k2s = _yaml_scalar(k2)
+                                if isinstance(v2, dict):
+                                    if not v2:
+                                        lines.append(f"{rest_pad}{k2s}: {{}}")
+                                    else:
+                                        lines.append(f"{rest_pad}{k2s}:")
+                                        _emit(v2, indent + 3, lines, in_list_item=False)
+                                elif isinstance(v2, list):
+                                    if not v2:
+                                        lines.append(f"{rest_pad}{k2s}: []")
+                                    else:
+                                        lines.append(f"{rest_pad}{k2s}:")
+                                        nested = "  " * (indent + 3)
+                                        for el in v2:
+                                            if isinstance(el, dict):
+                                                _emit([el], indent + 3, lines, in_list_item=False)
+                                            else:
+                                                lines.append(f"{nested}- {_yaml_scalar(el)}")
+                                else:
+                                    lines.append(f"{rest_pad}{k2s}: {_yaml_scalar(v2)}")
+                        else:
+                            lines.append(f"{child_pad}- {_yaml_scalar(item)}")
+            else:
+                lines.append(f"{prefix}{key}: {_yaml_scalar(v)}")
+            # After first list-item key, subsequent keys must carry indent (pad), not empty prefix.
+            if in_list_item and i == 0:
+                in_list_item = False
+        return
+    if isinstance(data, list):
+        if not data:
+            lines.append(f"{pad}[]")
+            return
+        for item in data:
+            if isinstance(item, dict):
+                if not item:
+                    lines.append(f"{pad}- {{}}")
+                    continue
+                sub_items = list(item.items())
+                fk, fv = sub_items[0]
+                if isinstance(fv, (dict, list)):
+                    lines.append(f"{pad}- {_yaml_scalar(fk)}:")
+                    if isinstance(fv, dict) and fv:
+                        _emit(fv, indent + 2, lines, in_list_item=False)
+                    elif isinstance(fv, list) and fv:
+                        nested = "  " * (indent + 2)
+                        for el in fv:
+                            if isinstance(el, dict):
+                                _emit([el], indent + 2, lines, in_list_item=False)
+                            else:
+                                lines.append(f"{nested}- {_yaml_scalar(el)}")
+                else:
+                    lines.append(f"{pad}- {_yaml_scalar(fk)}: {_yaml_scalar(fv)}")
+                rest_pad = "  " * (indent + 1)
+                for k2, v2 in sub_items[1:]:
+                    k2s = _yaml_scalar(k2)
+                    if isinstance(v2, dict):
+                        if not v2:
+                            lines.append(f"{rest_pad}{k2s}: {{}}")
+                        else:
+                            lines.append(f"{rest_pad}{k2s}:")
+                            _emit(v2, indent + 2, lines, in_list_item=False)
+                    elif isinstance(v2, list):
+                        if not v2:
+                            lines.append(f"{rest_pad}{k2s}: []")
+                        else:
+                            lines.append(f"{rest_pad}{k2s}:")
+                            nested = "  " * (indent + 2)
+                            for el in v2:
+                                if isinstance(el, dict):
+                                    _emit([el], indent + 2, lines, in_list_item=False)
+                                else:
+                                    lines.append(f"{nested}- {_yaml_scalar(el)}")
+                    else:
+                        lines.append(f"{rest_pad}{k2s}: {_yaml_scalar(v2)}")
+            else:
+                lines.append(f"{pad}- {_yaml_scalar(item)}")
+        return
+    # scalar
+    lines.append(f"{pad}{_yaml_scalar(data)}")
+
+
+def yaml_load(text: str) -> Any:
+    """Parse the subset of YAML that we write ourselves.
+
+    Supports:
+      - mappings (``key: value``)
+      - nested mappings by 2-space indent
+      - lists of scalars or mappings (``- value`` / ``- key: v``)
+      - quoted and unquoted scalars, integers, floats, booleans, null
+    """
+    lines = [ln.rstrip("\n") for ln in text.split("\n") if ln.strip() and not ln.lstrip().startswith("#")]
+    idx = 0
+
+    def parse_scalar(s: str) -> Any:
+        s = s.strip()
+        if s == "" or s == "~" or s.lower() == "null":
+            return None
+        if s.lower() == "true":
+            return True
+        if s.lower() == "false":
+            return False
+        if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+            return s[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+        try:
+            if re.fullmatch(r"-?\d+", s):
+                return int(s)
+            if re.fullmatch(r"-?\d+\.\d+", s):
+                return float(s)
+        except ValueError:
+            pass
+        return s
+
+    def indent_of(ln: str) -> int:
+        return len(ln) - len(ln.lstrip(" "))
+
+    def parse_block(base_indent: int) -> Any:
+        nonlocal idx
+        # Decide: mapping vs list based on first token at base_indent.
+        if idx >= len(lines):
+            return None
+        first = lines[idx]
+        if indent_of(first) < base_indent:
+            return None
+        if first.lstrip().startswith("- "):
+            return parse_list(base_indent)
+        return parse_map(base_indent)
+
+    def parse_map(base_indent: int) -> dict:
+        nonlocal idx
+        result: dict = {}
+        while idx < len(lines):
+            ln = lines[idx]
+            ind = indent_of(ln)
+            if ind < base_indent:
+                break
+            if ind > base_indent:
+                raise MiniYAMLError(f"unexpected indent at line: {ln!r}")
+            stripped = ln.lstrip()
+            if stripped.startswith("- "):
+                break
+            m = re.match(r"([A-Za-z0-9_./@-]+|\"[^\"]+\"|'[^']+'):\s*(.*)$", stripped)
+            if not m:
+                raise MiniYAMLError(f"unparsable line: {ln!r}")
+            raw_key = m.group(1)
+            if raw_key.startswith(('"', "'")):
+                key = raw_key[1:-1]
+            else:
+                key = raw_key
+            rest = m.group(2)
+            idx += 1
+            if rest == "" or rest is None:
+                # Nested structure
+                if idx < len(lines) and indent_of(lines[idx]) > base_indent:
+                    child_indent = indent_of(lines[idx])
+                    result[key] = parse_block(child_indent)
+                else:
+                    result[key] = None
+            elif rest == "{}":
+                result[key] = {}
+            elif rest == "[]":
+                result[key] = []
+            else:
+                result[key] = parse_scalar(rest)
+        return result
+
+    def parse_list(base_indent: int) -> list:
+        nonlocal idx
+        result: list = []
+        while idx < len(lines):
+            ln = lines[idx]
+            ind = indent_of(ln)
+            if ind < base_indent:
+                break
+            stripped = ln.lstrip()
+            if not stripped.startswith("- "):
+                break
+            item_body = stripped[2:]
+            idx += 1
+            # If item body has "k: v", treat as inline mapping entry — may continue on subsequent indented lines.
+            if re.match(r"[A-Za-z0-9_./@-]+\s*:", item_body) or (
+                item_body.startswith('"') and '":' in item_body
+            ):
+                # Reinsert as a virtual map line under this list item.
+                inline_indent = base_indent + 2
+                # Build a sub-map starting with this key.
+                virtual_line = " " * inline_indent + item_body
+                lines.insert(idx, virtual_line)
+                m = parse_map(inline_indent)
+                result.append(m)
+            elif item_body == "" or item_body is None:
+                # Nested mapping on subsequent lines.
+                if idx < len(lines) and indent_of(lines[idx]) > base_indent:
+                    result.append(parse_block(indent_of(lines[idx])))
+                else:
+                    result.append(None)
+            else:
+                result.append(parse_scalar(item_body))
+        return result
+
+    if not lines:
+        return {}
+    root_indent = indent_of(lines[0])
+    return parse_block(root_indent) if lines else {}
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+
+def repo_root() -> pathlib.Path:
+    try:
+        out = subprocess.check_output(["git", "rev-parse", "--show-toplevel"], stderr=subprocess.DEVNULL)
+        return pathlib.Path(out.decode().strip())
+    except subprocess.CalledProcessError:
+        return pathlib.Path.cwd()
+
+
+def current_branch() -> str:
+    try:
+        out = subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"], stderr=subprocess.DEVNULL)
+        return out.decode().strip()
+    except subprocess.CalledProcessError:
+        return "HEAD"
+
+
+def state_path(root: pathlib.Path | None = None) -> pathlib.Path:
+    root = root or repo_root()
+    return root / ".loopy" / "state.yml"
+
+
+def read_state(root: pathlib.Path | None = None) -> dict:
+    sp = state_path(root)
+    if not sp.exists():
+        return {}
+    try:
+        return yaml_load(sp.read_text()) or {}
+    except MiniYAMLError as e:
+        raise SystemExit(f"error: failed to parse {sp}: {e}")
+
+
+def write_state(data: dict, root: pathlib.Path | None = None) -> pathlib.Path:
+    sp = state_path(root)
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    data.setdefault("schema_version", 1)
+    data["last_updated"] = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    sp.write_text(yaml_dump(data))
+    return sp
+
+
+# ---------------------------------------------------------------------------
+# Schema: PRD validator
+# ---------------------------------------------------------------------------
+
+
+REQ_ID_RE = re.compile(r"^R\d+$")
+REQ_PRIORITIES = {"Core", "Must", "Nice", "Out"}
+
+
+def _extract_section(md: str, heading_re: str) -> str | None:
+    """Extract content under the first heading matching the regex, until the next heading of same or higher level."""
+    lines = md.split("\n")
+    out: list[str] = []
+    start = None
+    start_level = None
+    pat = re.compile(heading_re)
+    for i, ln in enumerate(lines):
+        m = re.match(r"^(#{1,6})\s+(.*)$", ln)
+        if m:
+            level = len(m.group(1))
+            if start is None:
+                if pat.search(m.group(2)):
+                    start = i + 1
+                    start_level = level
+                continue
+            if level <= start_level:
+                break
+        if start is not None:
+            out.append(ln)
+    return "\n".join(out) if start is not None else None
+
+
+def _first_table(text: str) -> list[list[str]] | None:
+    """Return a parsed markdown pipe-table (header row + data rows) or None."""
+    lines = text.split("\n")
+    # Find the header (line) + separator (|---|---|).
+    for i in range(len(lines) - 1):
+        header = lines[i].strip()
+        sep = lines[i + 1].strip()
+        if header.startswith("|") and re.match(r"^\|?[\s:|-]+\|[\s:|-]+\|?$", sep):
+            rows: list[list[str]] = []
+            def _split(row: str) -> list[str]:
+                parts = [c.strip() for c in row.strip().strip("|").split("|")]
+                return parts
+            rows.append(_split(header))
+            for j in range(i + 2, len(lines)):
+                row = lines[j].strip()
+                if not row.startswith("|"):
+                    break
+                rows.append(_split(row))
+            return rows
+    return None
+
+
+def validate_prd(path: pathlib.Path) -> list[str]:
+    errors: list[str] = []
+    if not path.exists():
+        return [f"PRD not found: {path}"]
+    md = path.read_text()
+
+    # Required top-level sections
+    for heading in ["Goal", "Scope", "Requirements", "Next Steps"]:
+        if _extract_section(md, rf"^{re.escape(heading)}\b") is None:
+            errors.append(f"missing required section: ## {heading}")
+
+    # Requirements table
+    req_section = _extract_section(md, r"^Requirements\b")
+    if req_section is not None:
+        tbl = _first_table(req_section)
+        if tbl is None:
+            errors.append("Requirements section: no markdown table found")
+        else:
+            header = [c.lower() for c in tbl[0]]
+            expected = ["id", "priority", "requirement"]
+            if header[:3] != expected:
+                errors.append(
+                    f"Requirements table header must be 'ID | Priority | Requirement', got: {' | '.join(tbl[0])}"
+                )
+            seen_ids: set[str] = set()
+            for row_idx, row in enumerate(tbl[1:], start=1):
+                if len(row) < 3:
+                    errors.append(f"Requirements row {row_idx}: fewer than 3 columns")
+                    continue
+                rid, prio, text = row[0], row[1], row[2]
+                if not REQ_ID_RE.match(rid):
+                    errors.append(f"Requirements row {row_idx}: ID '{rid}' must match /^R\\d+$/")
+                elif rid in seen_ids:
+                    errors.append(f"Requirements row {row_idx}: duplicate ID '{rid}'")
+                else:
+                    seen_ids.add(rid)
+                if prio not in REQ_PRIORITIES:
+                    errors.append(
+                        f"Requirements row {row_idx} ({rid}): priority '{prio}' must be one of {sorted(REQ_PRIORITIES)}"
+                    )
+                if not text:
+                    errors.append(f"Requirements row {row_idx} ({rid}): requirement text is empty")
+
+    # Scope section must contain "In Scope" and "Boundaries" subheadings
+    scope = _extract_section(md, r"^Scope\b")
+    if scope is not None:
+        if not re.search(r"^###\s+In Scope\b", scope, re.M):
+            errors.append("Scope section: missing '### In Scope'")
+        if not re.search(r"^###\s+Boundaries\b", scope, re.M):
+            errors.append("Scope section: missing '### Boundaries'")
+
+    # Header metadata
+    if not re.search(r"^\*\*Date:\*\*", md, re.M):
+        errors.append("missing header: **Date:**")
+    if not re.search(r"^\*\*Status:\*\*", md, re.M):
+        errors.append("missing header: **Status:**")
+
+    # Open Questions: each bullet should be tagged with [Affects ...]
+    oq = _extract_section(md, r"^Open Questions\b")
+    if oq is not None:
+        for ln in oq.split("\n"):
+            s = ln.strip()
+            if s.startswith("- "):
+                if not re.search(r"\[Affects\s+[^\]]+\]", s):
+                    errors.append(f"Open Questions: bullet missing [Affects ...] tag: {s}")
+
+    return errors
+
+
+# ---------------------------------------------------------------------------
+# Schema: Tech plan validator
+# ---------------------------------------------------------------------------
+
+
+SUBTASK_HEADING_RE = re.compile(r"^####\s+(\d+)\.(\d+)\s+(.+?)\s*$", re.M)
+DEPENDS_RE = re.compile(r"^\*\*Depends on:\*\*\s*(.+?)\s*$", re.M)
+FILES_RE = re.compile(r"^\*\*Files:\*\*\s*(.+?)\s*$", re.M)
+TEST_SCENARIOS_RE = re.compile(r"^\*\*Test scenarios:\*\*\s*(?:\(([^)]+)\))?\s*$", re.M)
+VERIFY_RE = re.compile(r"^\*\*Verify:\*\*\s*(.+?)\s*$", re.M)
+
+
+def _parse_subtasks(md: str) -> list[dict]:
+    """Split plan markdown into subtask dicts with extracted fields."""
+    # Find all subtask headings and their byte offsets.
+    matches = list(SUBTASK_HEADING_RE.finditer(md))
+    subtasks: list[dict] = []
+    for i, m in enumerate(matches):
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(md)
+        body = md[start:end]
+        depends_m = DEPENDS_RE.search(body)
+        files_m = FILES_RE.search(body)
+        ts_m = TEST_SCENARIOS_RE.search(body)
+        verify_m = VERIFY_RE.search(body)
+        parent = int(m.group(1))
+        child = int(m.group(2))
+        sid = f"{parent}.{child}"
+
+        depends: list[str] = []
+        if depends_m:
+            raw = depends_m.group(1).strip()
+            if raw.lower() != "none":
+                depends = [d.strip() for d in raw.split(",") if d.strip()]
+
+        files: list[str] = []
+        if files_m:
+            # Files field contains backtick-wrapped paths comma-separated.
+            files = [p.strip("` ") for p in files_m.group(1).split(",") if p.strip()]
+
+        ts_scenarios_start = ts_m.end() if ts_m else None
+        # Scenario bullets: lines starting with "- " directly after the Test scenarios header,
+        # until a blank line followed by another header (bold line) or next subtask.
+        scenarios: list[str] = []
+        if ts_scenarios_start is not None:
+            rest = body[ts_scenarios_start:]
+            for ln in rest.split("\n"):
+                s = ln.strip()
+                if s.startswith("- "):
+                    scenarios.append(s[2:].strip())
+                elif s.startswith("**") or s.startswith("####"):
+                    break
+                elif s == "":
+                    # allow blank lines in the middle
+                    if scenarios and not any(
+                        l.strip().startswith("- ") for l in rest.split("\n")[rest.split("\n").index(ln) + 1:]
+                    ):
+                        break
+                    continue
+
+        subtasks.append(
+            {
+                "id": sid,
+                "title": m.group(3).strip(),
+                "parent": parent,
+                "child": child,
+                "depends_on": depends,
+                "files": files,
+                "test_scenarios": scenarios,
+                "test_file": (ts_m.group(1).strip().strip('`').strip() if ts_m and ts_m.group(1) else None),
+                "verify": (verify_m.group(1).strip() if verify_m else None),
+                "body": body,
+            }
+        )
+    return subtasks
+
+
+# Subtasks whose title strongly implies a feature (needs tests). Keep broad.
+FEATURE_KEYWORDS = re.compile(r"\b(add|implement|build|create|introduce|support|fix|handle|validate)\b", re.I)
+# Subtasks that look infrastructural/config — override FEATURE_KEYWORDS when present.
+NONFEATURE_KEYWORDS = re.compile(
+    r"\b(config|configs|docs?|documentation|rename|move|bump|update\s+deps|refactor\s+only|readme|"
+    r"install|installer|binar(?:y|ies)|script|scripts|changelog|license|gitignore|makefile)\b",
+    re.I,
+)
+
+
+def is_feature_subtask(s: dict) -> bool:
+    title = s["title"]
+    # If there are any test scenarios declared in the plan, trust that signal —
+    # author is asserting it has testable behavior.
+    if s["test_scenarios"]:
+        return True
+    # Explicit non-feature cue in title takes precedence over feature verbs.
+    if NONFEATURE_KEYWORDS.search(title):
+        return False
+    # Otherwise default to feature if title matches typical feature verbs.
+    return bool(FEATURE_KEYWORDS.search(title))
+
+
+def validate_plan(path: pathlib.Path) -> list[str]:
+    errors: list[str] = []
+    if not path.exists():
+        return [f"Plan not found: {path}"]
+    md = path.read_text()
+
+    # Header fields
+    if not re.search(r"^\*\*Date:\*\*", md, re.M):
+        errors.append("missing header: **Date:**")
+    if not re.search(r"^\*\*Status:\*\*", md, re.M):
+        errors.append("missing header: **Status:**")
+    if not re.search(r"^\*\*PRD:\*\*", md, re.M):
+        errors.append("missing header: **PRD:**  (use 'None' if no PRD exists)")
+
+    if not re.search(r"^##\s+Overview\b", md, re.M):
+        errors.append("missing section: ## Overview")
+    if not re.search(r"^##\s+Architecture\b", md, re.M):
+        errors.append("missing section: ## Architecture")
+
+    subtasks = _parse_subtasks(md)
+    if not subtasks:
+        errors.append("no subtasks found (expected '#### N.M Title' headings)")
+        return errors
+
+    # Check numbering: each parent's subtasks must be 1..K without gaps.
+    by_parent: dict[int, list[int]] = {}
+    for s in subtasks:
+        by_parent.setdefault(s["parent"], []).append(s["child"])
+    for parent, children in by_parent.items():
+        children_sorted = sorted(children)
+        expected = list(range(1, len(children_sorted) + 1))
+        if children_sorted != expected:
+            errors.append(
+                f"parent {parent}: subtask numbering has gaps or duplicates "
+                f"(got {children_sorted}, expected {expected})"
+            )
+
+    # Validate each subtask
+    ids = {s["id"] for s in subtasks}
+    for s in subtasks:
+        sid = s["id"]
+        prefix = f"subtask {sid} ({s['title']})"
+        # Depends on
+        if DEPENDS_RE.search(s["body"]) is None:
+            errors.append(f"{prefix}: missing **Depends on:** field")
+        for dep in s["depends_on"]:
+            if dep not in ids:
+                errors.append(f"{prefix}: **Depends on:** references unknown subtask '{dep}'")
+            if dep == sid:
+                errors.append(f"{prefix}: cannot depend on itself")
+        # Files
+        if FILES_RE.search(s["body"]) is None:
+            errors.append(f"{prefix}: missing **Files:** field")
+        # Verify
+        if VERIFY_RE.search(s["body"]) is None:
+            errors.append(f"{prefix}: missing **Verify:** field")
+
+        # Feature subtasks require test scenarios + a test file path.
+        if is_feature_subtask(s):
+            if TEST_SCENARIOS_RE.search(s["body"]) is None:
+                errors.append(f"{prefix}: feature subtask missing **Test scenarios:** section")
+            else:
+                if not s["test_scenarios"]:
+                    errors.append(f"{prefix}: **Test scenarios:** present but no scenario bullets")
+                if not s["test_file"]:
+                    errors.append(
+                        f"{prefix}: feature subtask **Test scenarios:** missing test-file "
+                        f"parenthetical, e.g. '**Test scenarios:** (path/to/test.ts)'"
+                    )
+                else:
+                    if s["test_file"] not in s["files"]:
+                        errors.append(
+                            f"{prefix}: test file '{s['test_file']}' from Test scenarios "
+                            f"not listed in **Files:** ({s['files']})"
+                        )
+
+    # Cycle detection on depends_on (DFS).
+    graph = {s["id"]: s["depends_on"] for s in subtasks}
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {k: WHITE for k in graph}
+
+    def dfs(node: str, path: list[str]) -> bool:
+        color[node] = GRAY
+        for nb in graph.get(node, []):
+            if nb not in color:
+                continue
+            if color[nb] == GRAY:
+                cycle = " -> ".join(path + [node, nb])
+                errors.append(f"dependency cycle detected: {cycle}")
+                return True
+            if color[nb] == WHITE:
+                if dfs(nb, path + [node]):
+                    return True
+        color[node] = BLACK
+        return False
+
+    for node in list(graph.keys()):
+        if color[node] == WHITE:
+            if dfs(node, []):
+                break
+
+    return errors
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: validate
+# ---------------------------------------------------------------------------
+
+
+def cmd_validate(args: argparse.Namespace) -> int:
+    path = pathlib.Path(args.path)
+    if args.kind == "prd":
+        errors = validate_prd(path)
+    elif args.kind == "plan":
+        errors = validate_plan(path)
+    else:
+        print(f"unknown validate kind: {args.kind}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps({"path": str(path), "kind": args.kind, "errors": errors}, indent=2))
+    else:
+        if errors:
+            print(f"FAIL: {path} ({args.kind}) — {len(errors)} error(s):")
+            for e in errors:
+                print(f"  - {e}")
+        else:
+            print(f"OK: {path} ({args.kind}) — schema valid")
+    return 1 if errors else 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: state
+# ---------------------------------------------------------------------------
+
+
+def _ensure_state_scaffold() -> dict:
+    data = read_state()
+    data.setdefault("schema_version", 1)
+    data.setdefault("branch", current_branch())
+    data.setdefault("stage", "unknown")
+    data.setdefault("section_baselines", {})
+    data.setdefault("reviews", [])
+    data.setdefault("budget", {"entries": [], "totals": {}})
+    return data
+
+
+def cmd_state_show(args: argparse.Namespace) -> int:
+    data = read_state()
+    if args.json:
+        print(json.dumps(data, indent=2, default=str))
+    else:
+        if not data:
+            print(f"(no state file at {state_path()})")
+            return 0
+        print(yaml_dump(data).rstrip())
+    return 0
+
+
+def cmd_state_set(args: argparse.Namespace) -> int:
+    data = _ensure_state_scaffold()
+    # Parse value — try int, float, bool, else string.
+    raw = args.value
+    val: Any
+    if raw.lower() in {"true", "false"}:
+        val = raw.lower() == "true"
+    elif re.fullmatch(r"-?\d+", raw):
+        val = int(raw)
+    elif re.fullmatch(r"-?\d+\.\d+", raw):
+        val = float(raw)
+    else:
+        val = raw
+    # Support dotted keys up to two levels (e.g., plan, prd, feature).
+    parts = args.key.split(".")
+    ref = data
+    for p in parts[:-1]:
+        ref = ref.setdefault(p, {})
+        if not isinstance(ref, dict):
+            print(f"error: cannot set nested key under non-mapping at '{p}'", file=sys.stderr)
+            return 2
+    ref[parts[-1]] = val
+    write_state(data)
+    print(f"set {args.key} = {val!r}")
+    return 0
+
+
+def cmd_state_baseline(args: argparse.Namespace) -> int:
+    data = _ensure_state_scaffold()
+    data["section_baselines"][str(args.section)] = args.sha
+    write_state(data)
+    print(f"recorded baseline: section {args.section} @ {args.sha}")
+    return 0
+
+
+def cmd_state_review_add(args: argparse.Namespace) -> int:
+    data = _ensure_state_scaffold()
+    entry = {
+        "scope": args.scope,
+        "path": args.path,
+        "recorded_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    data.setdefault("reviews", []).append(entry)
+    write_state(data)
+    print(f"review recorded: scope={args.scope} path={args.path}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: verify-tests
+# ---------------------------------------------------------------------------
+
+
+TEST_FUNC_PATTERNS = [
+    re.compile(r"\bit\s*\(", re.M),           # Jest / Mocha
+    re.compile(r"\btest\s*\(", re.M),         # Jest / Vitest
+    re.compile(r"\bdescribe\s*\(", re.M),     # Jest / Mocha (block, ignored for count but signals tests exist)
+    re.compile(r"^\s*def\s+test_\w+", re.M),  # Pytest
+    re.compile(r"^func\s+Test\w+\s*\(", re.M),# Go
+    re.compile(r"\b#\[test\]", re.M),         # Rust
+]
+
+
+def count_tests_in_file(path: pathlib.Path) -> int:
+    try:
+        text = path.read_text()
+    except (OSError, UnicodeDecodeError):
+        return 0
+    # Strip describe() blocks from count — only count leaf tests (it/test/def test_/func Test/#[test]).
+    leaf_patterns = [TEST_FUNC_PATTERNS[0], TEST_FUNC_PATTERNS[1], TEST_FUNC_PATTERNS[3], TEST_FUNC_PATTERNS[4], TEST_FUNC_PATTERNS[5]]
+    total = 0
+    for pat in leaf_patterns:
+        total += len(pat.findall(text))
+    return total
+
+
+def cmd_verify_tests(args: argparse.Namespace) -> int:
+    plan_path = pathlib.Path(args.plan)
+    subs = _parse_subtasks(plan_path.read_text() if plan_path.exists() else "")
+    target = None
+    for s in subs:
+        if s["id"] == args.subtask:
+            target = s
+            break
+    if target is None:
+        print(f"error: subtask {args.subtask} not found in {plan_path}", file=sys.stderr)
+        return 2
+
+    if not is_feature_subtask(target):
+        print(f"OK: subtask {args.subtask} ({target['title']}) is not a feature subtask — skipped")
+        return 0
+
+    if not target["test_file"]:
+        print(f"FAIL: subtask {args.subtask}: no test file parenthetical in Test scenarios", file=sys.stderr)
+        return 1
+
+    root = repo_root()
+    tf = root / target["test_file"]
+    if not tf.exists():
+        print(f"FAIL: test file not found: {tf}", file=sys.stderr)
+        return 1
+
+    expected = len(target["test_scenarios"])
+    actual = count_tests_in_file(tf)
+    if expected == 0:
+        print(f"WARN: subtask {args.subtask}: no scenarios declared in plan")
+        return 0
+    if actual < expected:
+        print(
+            f"FAIL: subtask {args.subtask}: test file has {actual} test cases "
+            f"but plan declares {expected} scenarios",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        f"OK: subtask {args.subtask} ({target['title']}) — {actual} test(s) "
+        f">= {expected} scenario(s) in {target['test_file']}"
+    )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: review-save
+# ---------------------------------------------------------------------------
+
+
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp"}
+
+
+def cmd_review_save(args: argparse.Namespace) -> int:
+    root = repo_root()
+    reviews_dir = root / "docs" / "reviews"
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    date = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+    safe_scope = re.sub(r"[^A-Za-z0-9._-]+", "-", args.scope).strip("-")
+    base = f"{date}-{safe_scope}"
+
+    attach_paths: list[pathlib.Path] = []
+    if args.attach:
+        for a in args.attach:
+            p = pathlib.Path(a)
+            if not p.exists():
+                print(f"error: attachment not found: {p}", file=sys.stderr)
+                return 2
+            attach_paths.append(p.resolve())
+
+    # Directory-mode when attachments are present; flat-file mode otherwise
+    # (preserves backward compatibility with existing callers and tests).
+    use_dir = bool(attach_paths)
+    if use_dir:
+        dir_target = reviews_dir / base
+        i = 2
+        while dir_target.exists():
+            dir_target = reviews_dir / f"{base}-{i}"
+            i += 1
+        dir_target.mkdir(parents=True)
+        target = dir_target / "index.md"
+    else:
+        target = reviews_dir / f"{base}.md"
+        i = 2
+        while target.exists():
+            target = reviews_dir / f"{base}-{i}.md"
+            i += 1
+
+    if args.stdin:
+        content = sys.stdin.read()
+    elif args.content is not None:
+        content = args.content
+    else:
+        print("error: provide --stdin or --content", file=sys.stderr)
+        return 2
+
+    header = (
+        f"# Code Review — {args.scope}\n\n"
+        f"**Date:** {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+        f"**Scope:** {args.scope}\n"
+    )
+    if args.plan:
+        header += f"**Plan:** {args.plan}\n"
+    if args.base_sha:
+        header += f"**Base SHA:** {args.base_sha}\n"
+    header += "\n---\n\n"
+
+    # Copy attachments into the review directory and build an Evidence section.
+    # Reserve the report filename so an attachment named 'index.md' (or whatever
+    # the report file is called) is suffixed instead of silently overwritten by
+    # the report write below.
+    evidence_lines: list[str] = []
+    if attach_paths:
+        evidence_lines.append("## Evidence\n")
+        import shutil
+        reserved = {target.name}
+        for src in attach_paths:
+            candidate = src.name
+            dst = target.parent / candidate
+            j = 2
+            while candidate in reserved or dst.exists():
+                candidate = f"{src.stem}-{j}{src.suffix}"
+                dst = target.parent / candidate
+                j += 1
+            shutil.copy2(src, dst)
+            reserved.add(candidate)
+            rel = dst.name  # same directory as the report
+            if src.suffix.lower() in IMAGE_EXTS:
+                evidence_lines.append(f"![{src.stem}]({rel})\n")
+            else:
+                evidence_lines.append(f"- [{src.name}]({rel})\n")
+        evidence_lines.append("")
+
+    body = content.rstrip() + "\n"
+    if evidence_lines:
+        body = body + "\n" + "\n".join(evidence_lines) + "\n"
+    target.write_text(header + body)
+
+    # Record in state
+    data = _ensure_state_scaffold()
+    entry: dict[str, Any] = {
+        "scope": args.scope,
+        "path": str(target.relative_to(root)),
+        "recorded_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "plan": args.plan or None,
+        "base_sha": args.base_sha or None,
+    }
+    if attach_paths:
+        entry["attachments"] = [p.name for p in attach_paths]
+    data.setdefault("reviews", []).append(entry)
+    write_state(data)
+
+    # Link from plan if given and a "Reviews" section exists — append line, do not rewrite.
+    if args.plan:
+        plan_path = root / args.plan
+        if plan_path.exists():
+            plan_text = plan_path.read_text()
+            rel = os.path.relpath(target, plan_path.parent)
+            link_line = f"- [{args.scope}]({rel}) — {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d')}"
+            if re.search(r"^##\s+Reviews\b", plan_text, re.M):
+                # Append after the Reviews heading, preserving existing content.
+                plan_text = re.sub(
+                    r"(^##\s+Reviews\b.*?\n)",
+                    r"\1" + link_line + "\n",
+                    plan_text,
+                    count=1,
+                    flags=re.M,
+                )
+            else:
+                sep = "" if plan_text.endswith("\n\n") else ("\n" if plan_text.endswith("\n") else "\n\n")
+                plan_text += f"{sep}## Reviews\n\n{link_line}\n"
+            plan_path.write_text(plan_text)
+
+    print(str(target.relative_to(root)))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: browser-capture
+# ---------------------------------------------------------------------------
+
+
+def cmd_browser_capture(args: argparse.Namespace) -> int:
+    """Thin wrapper around `agent-browser` for spike / review screenshots.
+
+    Non-goals: this is not a full browser-automation surface. For anything
+    beyond 'open URL, take screenshot', call agent-browser directly via the
+    loopy-browse skill. This wrapper exists so skills can rely on a
+    stable CLI contract with clear exit codes:
+
+        0  success
+        2  bad arguments / fs error
+        3  agent-browser not installed (skills should degrade gracefully)
+        4  agent-browser ran but failed (timeouts, navigation errors, etc.)
+    """
+    import shutil
+    if shutil.which("agent-browser") is None:
+        print(
+            "agent-browser is not installed. Install with 'npm install -g agent-browser' "
+            "and 'agent-browser install'. Skipping capture.",
+            file=sys.stderr,
+        )
+        return 3
+
+    out = pathlib.Path(args.output)
+    if out.is_dir():
+        print(f"error: output path is a directory: {out}", file=sys.stderr)
+        return 2
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = ["agent-browser", "open", args.url]
+    if args.session:
+        cmd = ["agent-browser", "--session", args.session, "open", args.url]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        wait_cmd = ["agent-browser"]
+        if args.session:
+            wait_cmd += ["--session", args.session]
+        wait_cmd += ["wait", "--load", "networkidle"]
+        # Don't fail hard on wait errors — some pages never reach idle.
+        subprocess.run(wait_cmd, check=False, capture_output=True, text=True, timeout=args.timeout)
+        shot_cmd = ["agent-browser"]
+        if args.session:
+            shot_cmd += ["--session", args.session]
+        shot_cmd += ["screenshot", str(out)]
+        if args.full:
+            shot_cmd.append("--full")
+        subprocess.run(shot_cmd, check=True, capture_output=True, text=True, timeout=args.timeout)
+    except subprocess.CalledProcessError as e:
+        print(f"agent-browser failed: {e.stderr or e.stdout or e}", file=sys.stderr)
+        return 4
+    except subprocess.TimeoutExpired as e:
+        print(f"agent-browser timed out: {e}", file=sys.stderr)
+        return 4
+
+    if not out.exists():
+        print(f"agent-browser returned 0 but no file at {out}", file=sys.stderr)
+        return 4
+    print(str(out))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: budget
+# ---------------------------------------------------------------------------
+
+
+BUDGET_KINDS = {"tokens", "seconds", "usd"}
+
+
+def cmd_budget_add(args: argparse.Namespace) -> int:
+    if args.kind not in BUDGET_KINDS:
+        print(f"error: kind must be one of {sorted(BUDGET_KINDS)}", file=sys.stderr)
+        return 2
+    try:
+        amount = float(args.amount)
+    except ValueError:
+        print("error: amount must be a number", file=sys.stderr)
+        return 2
+    data = _ensure_state_scaffold()
+    data["budget"].setdefault("entries", [])
+    data["budget"]["entries"].append(
+        {
+            "kind": args.kind,
+            "amount": amount,
+            "stage": args.stage or "unknown",
+            "note": args.note or "",
+            "at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+    )
+    totals = data["budget"].setdefault("totals", {})
+    totals[args.kind] = float(totals.get(args.kind, 0)) + amount
+    write_state(data)
+    print(f"budget +{amount} {args.kind} (stage={args.stage}) — total {args.kind}={totals[args.kind]}")
+    return 0
+
+
+def cmd_budget_summary(args: argparse.Namespace) -> int:
+    data = read_state()
+    budget = (data or {}).get("budget") or {}
+    totals = budget.get("totals") or {}
+    entries = budget.get("entries") or []
+    if args.json:
+        print(json.dumps({"totals": totals, "entries": entries}, indent=2, default=str))
+        return 0
+    print("Budget summary")
+    print("--------------")
+    if not totals:
+        print("(no entries)")
+        return 0
+    for kind in sorted(totals.keys()):
+        print(f"  {kind}: {totals[kind]}")
+    # Per-stage breakdown
+    by_stage: dict[str, dict[str, float]] = {}
+    for e in entries:
+        stage = str(e.get("stage", "unknown"))
+        kind = str(e.get("kind", "?"))
+        by_stage.setdefault(stage, {}).setdefault(kind, 0.0)
+        by_stage[stage][kind] += float(e.get("amount", 0))
+    if by_stage:
+        print()
+        print("By stage:")
+        for stage in sorted(by_stage.keys()):
+            kinds = ", ".join(f"{k}={v}" for k, v in sorted(by_stage[stage].items()))
+            print(f"  {stage}: {kinds}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Argparse wiring
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="loopy", description="loopy SDLC helper CLI")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    # validate
+    v = sub.add_parser("validate", help="Validate PRD or plan against the schema")
+    vsub = v.add_subparsers(dest="kind", required=True)
+    for k in ("prd", "plan"):
+        pv = vsub.add_parser(k, help=f"Validate a {k.upper() if k == 'prd' else k} document")
+        pv.add_argument("path")
+        pv.add_argument("--json", action="store_true", help="Emit JSON output")
+        pv.set_defaults(func=cmd_validate, kind=k)
+
+    # state
+    st = sub.add_parser("state", help="Inspect/update pipeline state (.loopy/state.yml)")
+    stsub = st.add_subparsers(dest="subcmd", required=True)
+    show = stsub.add_parser("show", help="Show the state file")
+    show.add_argument("--json", action="store_true")
+    show.set_defaults(func=cmd_state_show)
+    sset = stsub.add_parser("set", help="Set a scalar key (supports dotted paths)")
+    sset.add_argument("key")
+    sset.add_argument("value")
+    sset.set_defaults(func=cmd_state_set)
+    bl = stsub.add_parser("section-baseline", help="Record a plan section's baseline SHA")
+    bl.add_argument("section")
+    bl.add_argument("sha")
+    bl.set_defaults(func=cmd_state_baseline)
+    rv = stsub.add_parser("review-add", help="Append a review record to state")
+    rv.add_argument("scope")
+    rv.add_argument("path")
+    rv.set_defaults(func=cmd_state_review_add)
+
+    # verify-tests
+    vt = sub.add_parser("verify-tests", help="Check that a feature subtask produced matching test cases")
+    vt.add_argument("plan")
+    vt.add_argument("subtask", help="Subtask id, e.g. 1.2")
+    vt.set_defaults(func=cmd_verify_tests)
+
+    # review-save
+    rs = sub.add_parser("review-save", help="Persist a review report and link from plan")
+    rs.add_argument("scope", help="Review scope label, e.g. section-1 / final / branch")
+    grp = rs.add_mutually_exclusive_group(required=True)
+    grp.add_argument("--stdin", action="store_true", help="Read review body from stdin")
+    grp.add_argument("--content", help="Inline review body")
+    rs.add_argument("--plan", help="Plan path to link from (relative to repo root)")
+    rs.add_argument("--base-sha", help="Base SHA the review was scoped to")
+    rs.add_argument(
+        "--attach",
+        action="append",
+        default=[],
+        help="Attach a file (screenshot / log / etc.). Repeatable. Switches output to a review directory with index.md.",
+    )
+    rs.set_defaults(func=cmd_review_save)
+
+    # browser-capture
+    bc = sub.add_parser(
+        "browser-capture",
+        help="Open a URL in agent-browser and write a screenshot. Exits 3 if agent-browser is not installed.",
+    )
+    bc.add_argument("url")
+    bc.add_argument("output", help="Screenshot output path (e.g. docs/spikes/.../screenshot.png)")
+    bc.add_argument("--full", action="store_true", help="Capture full page (pass --full to agent-browser)")
+    bc.add_argument("--session", help="agent-browser session name (for persisted cookies/auth)")
+    bc.add_argument("--timeout", type=int, default=30, help="Per-step timeout in seconds (default 30)")
+    bc.set_defaults(func=cmd_browser_capture)
+
+    # budget
+    bg = sub.add_parser("budget", help="Track token/time/usd budget across the workflow")
+    bgsub = bg.add_subparsers(dest="subcmd", required=True)
+    ba = bgsub.add_parser("add", help="Record a budget entry")
+    ba.add_argument("kind", choices=sorted(BUDGET_KINDS))
+    ba.add_argument("amount")
+    ba.add_argument("--stage", help="Which workflow stage (requirements/plan/build/review/wrapup)")
+    ba.add_argument("--note", help="Free-form note")
+    ba.set_defaults(func=cmd_budget_add)
+    bs = bgsub.add_parser("summary", help="Print a budget summary")
+    bs.add_argument("--json", action="store_true")
+    bs.set_defaults(func=cmd_budget_summary)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return int(args.func(args) or 0)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

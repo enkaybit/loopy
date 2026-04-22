@@ -1,0 +1,16 @@
+description = "Use agent-browser for browser-grounded browsing, extraction, screenshots, and web app interaction."
+prompt = """
+Use `agent-browser` as your browser automation layer for this task.
+
+Follow this project guide:
+@{skills/loopy-browse/SKILL.md}
+
+Execution rules:
+- Ground your work in live page state rather than model memory.
+- Prefer `snapshot -i`, refs like `@e1`, and explicit waits.
+- Re-snapshot after navigation or significant DOM changes.
+- Use screenshots when visual confirmation matters.
+- Summarize the important results instead of dumping large raw snapshots verbatim.
+
+If the user invoked `/browse` with arguments, the raw command text is appended below. Treat that appended text as the specific browser task to carry out.
+"""
